@@ -3165,10 +3165,20 @@ async function startOnlineMatch(roomId, isCreating) {
     enemies.forEach(e => { try { scene.remove(e.group); } catch(_){} });
     enemies = [];
     botRespawnQueue = [];
-
+ 
+    // Forzar respawn del jugador local en una posición segura del mapa ANTES
+    // de unirnos a la sala. Así el initialState que publicamos lleva una
+    // posición real (x,y,z) y todos los demás peers ven al jugador a la
+    // altura correcta desde el primer frame. Sin esto, el host quedaba en la
+    // posición default del menú (P1 nace en SPAWNS[0] al inicio del juego)
+    // y los joiners lo veían "elevado" hasta el primer tick de sincronización.
+    P1.dead = true; respawnPlayer(P1);
+    // Asegurarnos también de que P1.cam.position.y es válido (no NaN).
+    if (!isFinite(P1.cam.position.y)) P1.cam.position.y = PH;
+ 
     const ok = await joinRoom(roomId, isCreating);
     if (!ok) return;
-
+ 
     gameActive = true;
     document.getElementById('plock').classList.add('gone');
     if (!isMobile) document.getElementById('c1').requestPointerLock();
@@ -3576,8 +3586,18 @@ async function joinRoom(roomId, isCreating) {
         return false;
     }
 
+    // El estado inicial debe reflejar la posición REAL del jugador local en este
+    // momento (su cámara ya fue colocada por respawnPlayer/getSafeSpawn). Si
+    // hardcodeamos y:5 los demás clientes verían el modelo flotando en el aire
+    // hasta el primer 'child_changed' (~66ms), e incluso peor, las hitboxes
+    // remotas quedan a una altura incorrecta. Tomamos cam.position de P1.
     const initialState = {
-        name: onlineNick, x: 0, y: 5, z: 0, yaw: 0, pitch: 0,
+        name: onlineNick,
+        x: +(P1 && P1.cam ? P1.cam.position.x : 0).toFixed(2),
+        y: +(P1 && P1.cam ? P1.cam.position.y : PH).toFixed(2),
+        z: +(P1 && P1.cam ? P1.cam.position.z : 0).toFixed(2),
+        yaw: +(P1 ? P1.yaw : 0).toFixed(3),
+        pitch: +(P1 ? P1.pitch : 0).toFixed(3),
         hp: 100, dead: false, weapon: 'knife', t: Date.now()
     };
     try {
@@ -3597,13 +3617,21 @@ async function joinRoom(roomId, isCreating) {
         r.name = data.name || 'Player';
         r.hp = data.hp != null ? data.hp : 100;
         r.dead = !!data.dead;
-        r.targetX = data.x || 0; r.targetY = data.y || 0; r.targetZ = data.z || 0;
+        // OJO: data.y es la altura de OJOS del remoto (cam.position.y). Si por
+        // alguna razón llega null/undefined usamos PH como fallback razonable
+        // (jugador parado en y=0). NO usar `|| 0` porque si data.y == 0 (válido
+        // cuando el remoto está realmente al nivel del suelo del piso 0) eso
+        // sigue funcionando bien con la resta de PH al colocar el modelo.
+        r.targetX = (data.x != null) ? data.x : 0;
+        r.targetY = (data.y != null) ? data.y : PH;
+        r.targetZ = (data.z != null) ? data.z : 0;
         r.targetYaw = data.yaw || 0; r.targetPitch = data.pitch || 0;
         r.x = r.targetX; r.y = r.targetY; r.z = r.targetZ;
         r.yaw = r.targetYaw; r.pitch = r.targetPitch;
         r.weapon = data.weapon || 'knife';
         // r.y es la altura de la cámara (ojos) del remoto. La base del modelo
-        // debe ir al suelo, así que restamos PH (igual que para el jugador local).
+        // debe ir al suelo, así que restamos PH (igual que hacemos con el
+        // jugador local en updateP). Esto deja el modelo a la altura correcta.
         r.model.position.set(r.x, r.y - PH, r.z);
         remotePlayers[uid] = r;
         showToast('🟢 ' + r.name + ' entró a la sala', 'ok', 2000);
@@ -3698,6 +3726,12 @@ function onlineTick(dt) {
 }
 
 // Helper: lista de objetivos remotos para que doRay los considere.
+// IMPORTANTE: r.y ya es la altura de la CABEZA/OJOS del remoto (cam.position.y
+// del cliente que lo publica). En checkT(), targetY se usa como `cy` y de ahí
+// se derivan las hitboxes head=cy, chest=cy-0.5, legs=cy-1.2. Por tanto NO se
+// debe sumar ningún offset adicional aquí: si lo hacíamos (r.y + 1.6) las
+// hitboxes quedaban ~1.6m por encima del modelo visible, y los disparos al
+// cuerpo no impactaban (había que apuntar muy por encima del modelo).
 function getRemoteTargets() {
     const out = [];
     for (const uid in remotePlayers) {
@@ -3708,7 +3742,7 @@ function getRemoteTargets() {
             name: r.name,
             cam: null,
             targetX: r.x,
-            targetY: r.y + 1.6,   // altura de cabeza aprox
+            targetY: r.y,         // r.y == altura de ojos del remoto (cabeza)
             targetZ: r.z,
             _remote: true
         });
