@@ -3602,7 +3602,9 @@ async function joinRoom(roomId, isCreating) {
         r.x = r.targetX; r.y = r.targetY; r.z = r.targetZ;
         r.yaw = r.targetYaw; r.pitch = r.targetPitch;
         r.weapon = data.weapon || 'knife';
-        r.model.position.set(r.x, r.y, r.z);
+        // r.y es la altura de la cámara (ojos) del remoto. La base del modelo
+        // debe ir al suelo, así que restamos PH (igual que para el jugador local).
+        r.model.position.set(r.x, r.y - PH, r.z);
         remotePlayers[uid] = r;
         showToast('🟢 ' + r.name + ' entró a la sala', 'ok', 2000);
     });
@@ -3670,7 +3672,9 @@ function onlineTick(dt) {
         r.z += (r.targetZ - r.z) * lerpA;
         r.yaw   += (r.targetYaw   - r.yaw)   * lerpA;
         r.pitch += (r.targetPitch - r.pitch) * lerpA;
-        r.model.position.set(r.x, r.y, r.z);
+        // r.y viene como altura de cámara (ojos). Ponemos la base del modelo en el suelo
+        // restando la altura del jugador (PH), igual que hacemos con el jugador local.
+        r.model.position.set(r.x, r.y - PH, r.z);
         r.model.rotation.y = r.yaw + Math.PI;
         r.model.visible = !r.dead;
     }
