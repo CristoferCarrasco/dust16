@@ -584,9 +584,13 @@ let onlineDB      = null;        // referencia al rtdb root
 let onlineRoomRef = null;        // ref a /rooms/<id>
 let onlineMeRef   = null;        // ref a /rooms/<id>/players/<uid>
 let onlineHitsRef = null;        // ref a /rooms/<id>/events
+let onlineProjRef = null;        // ref a /rooms/<id>/projectiles
 const remotePlayers = {};        // uid -> { mesh, label, hp, name, lastState, targetX,Y,Z, ... }
+const remoteProjectiles = {};    // projId -> { type, mesh, vx,vy,vz, life, ownerUid, ... }
 let _onlineLastSent = 0;
 const ONLINE_SEND_HZ = 15;       // 15 envíos/seg (compromiso CPU/red)
+let _onlineHitsBaseline = 0;     // ms: marca al unirse a la sala para filtrar histórico
+                                 // sin depender del reloj remoto (tolera desfase entre PC/móvil).
 
 // --- FIREBASE INIT ---
 let _firebaseApp = null, _firebaseAuth = null;
@@ -880,7 +884,12 @@ function spawnThrowable(pos, quat, type, owner) {
     const vz = forward.z * 15 + ivz;
     // grounded=false: el fusible (timer) no avanza hasta tocar el suelo.
     // Al tocar el suelo se fija timer=1s y empieza la cuenta atrás.
-    activeThrowables.push({ mesh: mesh, type: type, vx: vx, vy: vy, vz: vz, timer: 1.0, owner: owner, grounded: false });
+    const obj = { mesh: mesh, type: type, vx: vx, vy: vy, vz: vz, timer: 1.0, owner: owner, grounded: false, _netId: null };
+    activeThrowables.push(obj);
+    // ONLINE: publicar el spawn para que los demás clientes lo vean
+    if (onlineMode && owner === P1) {
+        obj._netId = pushNetProjectile(type, pos, new THREE.Vector3(vx, vy, vz));
+    }
 }
  
 // --- COHETES (Bazooka) ---
@@ -899,11 +908,15 @@ function spawnRocket(pos, dir, owner) {
     grp.lookAt(lookAt);
     scene.add(grp);
     const speed = 42;
-    activeRockets.push({
+    const obj = {
         mesh: grp,
         vx: dir.x * speed, vy: dir.y * speed, vz: dir.z * speed,
-        life: 4.0, owner, splashDmg: 180, splashRadius: 5.5
-    });
+        life: 4.0, owner, splashDmg: 180, splashRadius: 5.5, _netId: null
+    };
+    activeRockets.push(obj);
+    if (onlineMode && owner === P1) {
+        obj._netId = pushNetProjectile('rocket', pos, new THREE.Vector3(obj.vx, obj.vy, obj.vz));
+    }
 }
  
 function detonateExplosion(pos, splashDmg, splashRadius, attacker) {
@@ -965,6 +978,24 @@ function detonateExplosion(pos, splashDmg, splashRadius, attacker) {
             if (dmg > 0) dmgPlayer(p, dmg, (attacker && attacker !== p) ? attacker : null);
         }
     });
+    // ONLINE: daño a jugadores remotos. Solo el atacante (P1) reporta el daño
+    // por la red para evitar que el mismo daño se aplique varias veces.
+    if (onlineMode && attacker && attacker === P1) {
+        for (const uid in remotePlayers) {
+            const r = remotePlayers[uid];
+            if (!r || r.dead) continue;
+            const dx = r.x - pos.x, dy = (r.y - 0.8) - pos.y, dz = r.z - pos.z;
+            const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            if (dist <= splashRadius) {
+                const fall = 1 - (dist / splashRadius);
+                const dmg = Math.round(splashDmg * fall);
+                if (dmg > 0) {
+                    kfeed(attacker, `🌐💥 ${r.name || 'rival'}: -${dmg}hp`);
+                    reportRemoteHit(uid, dmg, 'splash', r.name);
+                }
+            }
+        }
+    }
 }
  
 // --- TRAMPAS DE OSO ---
@@ -1052,11 +1083,16 @@ function spawnGasGrenade(pos, quat, owner) {
     // Inercia: suma la velocidad horizontal del jugador a la del proyectil
     const ivx = (owner && typeof owner.velX === 'number') ? owner.velX : 0;
     const ivz = (owner && typeof owner.velZ === 'number') ? owner.velZ : 0;
-    activeGasGrenades.push({
+    const vx = forward.x * 14 + ivx, vy = forward.y * 14 + 3, vz = forward.z * 14 + ivz;
+    const obj = {
         mesh,
-        vx: forward.x * 14 + ivx, vy: forward.y * 14 + 3, vz: forward.z * 14 + ivz,
-        timer: 1.0, owner, grounded: false
-    });
+        vx, vy, vz,
+        timer: 1.0, owner, grounded: false, _netId: null
+    };
+    activeGasGrenades.push(obj);
+    if (onlineMode && owner === P1) {
+        obj._netId = pushNetProjectile('gas', pos, new THREE.Vector3(vx, vy, vz));
+    }
 }
  
 function updateGasGrenades(dt) {
@@ -1076,6 +1112,7 @@ function updateGasGrenades(dt) {
             });
             if (audioReady) { try { audioSys.mechSynth.triggerAttackRelease('16n'); } catch(e){} }
             scene.remove(g.mesh);
+            if (g._netId) removeNetProjectile(g._netId);
             activeGasGrenades.splice(i, 1);
         }
     }
@@ -1137,6 +1174,19 @@ function updateGasClouds(dt) {
                     p._gasResidueOwner = (c.owner && c.owner !== p) ? c.owner : null;
                 }
             });
+            // ONLINE: daño a remotos (solo si la nube es del jugador local P1).
+            // Las nubes remotas (isRemote=true) no aplican daño desde aquí: cada cliente
+            // lo aplica a sus locales en su propio tick.
+            if (onlineMode && c.owner && c.owner === P1) {
+                for (const uid in remotePlayers) {
+                    const r = remotePlayers[uid];
+                    if (!r || r.dead) continue;
+                    const dx = r.x - c.x, dy = (r.y - 0.8) - c.y, dz = r.z - c.z;
+                    if (dx*dx + dy*dy + dz*dz <= GAS_RADIUS * GAS_RADIUS) {
+                        reportRemoteHit(uid, GAS_DMG_PER_TICK, 'gas', r.name);
+                    }
+                }
+            }
             // Daño a enemigos
             for (let j = enemies.length - 1; j >= 0; j--) {
                 const e = enemies[j];
@@ -1270,6 +1320,7 @@ function updateRockets(dt) {
         if (exploded || r.life <= 0) {
             if (r.life <= 0 && !exploded) detonateExplosion(r.mesh.position.clone(), r.splashDmg * 0.6, r.splashRadius * 0.7, r.owner);
             scene.remove(r.mesh);
+            if (r._netId) removeNetProjectile(r._netId);
             activeRockets.splice(i, 1);
         }
     }
@@ -1327,11 +1378,16 @@ function spawnThrownKnife(pos, dir, owner) {
     // Inercia: sumamos la velocidad horizontal del jugador
     const ivx = (owner && typeof owner.velX === 'number') ? owner.velX : 0;
     const ivz = (owner && typeof owner.velZ === 'number') ? owner.velZ : 0;
-    activeThrownKnives.push({
+    const vx = dir.x * speed + ivx, vy = dir.y * speed, vz = dir.z * speed + ivz;
+    const obj = {
         mesh: m,
-        vx: dir.x * speed + ivx, vy: dir.y * speed, vz: dir.z * speed + ivz,
-        life: 3.5, owner
-    });
+        vx, vy, vz,
+        life: 3.5, owner, _netId: null
+    };
+    activeThrownKnives.push(obj);
+    if (onlineMode && owner === P1) {
+        obj._netId = pushNetProjectile('tknife', pos, new THREE.Vector3(vx, vy, vz));
+    }
 }
 let activeThrownKnives = [];
 function updateThrownKnives(dt) {
@@ -1382,6 +1438,18 @@ function updateThrownKnives(dt) {
                     if (dx*dx + dy*dy + dz*dz < 0.55*0.55) hitTarget = { kind: 'player', ref: pp };
                 });
             }
+            // ONLINE: comprobar jugadores remotos (solo el dueño local impacta vía red)
+            if (!hitTarget && onlineMode && k.owner === P1) {
+                for (const uid in remotePlayers) {
+                    const r = remotePlayers[uid];
+                    if (!r || r.dead) continue;
+                    const dx = r.x - k.mesh.position.x, dy = (r.y - 0.8) - k.mesh.position.y, dz = r.z - k.mesh.position.z;
+                    if (dx*dx + dy*dy + dz*dz < 0.65*0.65) {
+                        hitTarget = { kind: 'remote', uid: uid, name: r.name };
+                        break;
+                    }
+                }
+            }
             // 2) Mapa
             if (!hitTarget) {
                 physRc.far = segLen + 0.2;
@@ -1413,11 +1481,16 @@ function updateThrownKnives(dt) {
                 spawnParticles(hitTarget.ref.cam.position, 'blood', 18, 3, 0.4);
                 kfeed(k.owner, `🗡 P${hitTarget.ref.idx + 1} ¡Cuchillazo letal!`);
                 dmgPlayer(hitTarget.ref, hitTarget.ref.hp + 999, k.owner);
+            } else if (hitTarget.kind === 'remote') {
+                const r = remotePlayers[hitTarget.uid];
+                if (r) spawnParticles(new THREE.Vector3(r.x, r.y - 0.6, r.z), 'blood', 18, 3, 0.4);
+                kfeed(k.owner, `🌐🗡 ${hitTarget.name || 'rival'} ¡Cuchillazo letal!`);
+                reportRemoteHit(hitTarget.uid, 200, 'tknife', hitTarget.name);
             }
-            scene.remove(k.mesh); activeThrownKnives.splice(i, 1); continue;
+            scene.remove(k.mesh); if (k._netId) removeNetProjectile(k._netId); activeThrownKnives.splice(i, 1); continue;
         }
         if (hitWasMap || k.life <= 0) {
-            scene.remove(k.mesh); activeThrownKnives.splice(i, 1);
+            scene.remove(k.mesh); if (k._netId) removeNetProjectile(k._netId); activeThrownKnives.splice(i, 1);
         }
     }
 }
@@ -1567,7 +1640,7 @@ function updateVFX(dt) {
           if (t.type === 'flashbang') detonateFlashbang(t.mesh.position);
           else if (t.type === 'smoke') { activeSmokes.push({ x: t.mesh.position.x, y: t.mesh.position.y, z: t.mesh.position.z, timer: 10.0 }); playGunSound('smoke'); }
           else if (t.type === 'repulsion') detonateRepulsion(t.mesh.position, t.owner);
-          scene.remove(t.mesh); activeThrowables.splice(i, 1);
+          scene.remove(t.mesh); if (t._netId) removeNetProjectile(t._netId); activeThrowables.splice(i, 1);
       }
   }
   for (let i = activeSmokes.length - 1; i >= 0; i--) {
@@ -1932,11 +2005,42 @@ function checkRE() {
 
 function getSafeSpawn() {
     let bestSpawn = SPAWNS[0]; let maxDist = -1;
-    for (let i = 0; i < SPAWNS.length; i++) {
-        let s = SPAWNS[i]; let closestDist = Infinity;
-        for (let j = 0; j < enemies.length; j++) { let e = enemies[j]; if (e.dead) continue; let dist = Math.sqrt(Math.pow(e.x - s.x, 2) + Math.pow(e.z - s.z, 2)); if (dist < closestDist) closestDist = dist; }
-        if (closestDist > maxDist) { maxDist = closestDist; bestSpawn = s; }
+    // Construir lista de "amenazas" a evitar: enemigos vivos + jugadores activos vivos + jugadores remotos vivos.
+    // Así el spawn no caerá encima de alguien que ya esté en el mapa.
+    const threats = [];
+    for (let j = 0; j < enemies.length; j++) { const e = enemies[j]; if (!e.dead) threats.push({ x: e.x, z: e.z }); }
+    // Otros jugadores locales (split-screen) excluyendo a uno que esté muerto/respawneando
+    if (typeof activePlayers === 'function') {
+        for (const op of activePlayers()) { if (op && !op.dead) threats.push({ x: op.cam.position.x, z: op.cam.position.z }); }
     }
+    // Jugadores remotos online
+    if (typeof remotePlayers === 'object' && remotePlayers) {
+        for (const uid in remotePlayers) {
+            const r = remotePlayers[uid]; if (!r || r.dead) continue;
+            threats.push({ x: r.x, z: r.z });
+        }
+    }
+    // Si NO hay amenazas, en vez de elegir siempre SPAWNS[0] (centro del mapa) elegimos
+    // un punto aleatorio. Esto evita que en online, sin bots, todos respawneen juntos.
+    if (threats.length === 0 && SPAWNS.length > 1) {
+        return SPAWNS[Math.floor(Math.random() * SPAWNS.length)];
+    }
+    // Buscar el spawn cuya amenaza más cercana esté lo más lejos posible.
+    // Empates aleatorios para distribuir spawns en lugar de fijarse en el primero.
+    const bestList = [];
+    for (let i = 0; i < SPAWNS.length; i++) {
+        const s = SPAWNS[i]; let closestDist = Infinity;
+        for (let j = 0; j < threats.length; j++) {
+            const dx = threats[j].x - s.x, dz = threats[j].z - s.z;
+            const d2v = dx*dx + dz*dz;
+            if (d2v < closestDist) closestDist = d2v;
+        }
+        if (closestDist > maxDist) { maxDist = closestDist; bestList.length = 0; bestList.push(s); bestSpawn = s; }
+        else if (closestDist === maxDist) { bestList.push(s); }
+    }
+    // Mínimo de seguridad: si la mejor distancia está por debajo de 4m, exigir al menos
+    // ese mínimo y, si ningún spawn lo cumple, escoger igualmente el más alejado.
+    if (bestList.length > 1) return bestList[Math.floor(Math.random() * bestList.length)];
     return bestSpawn;
 }
 
@@ -2121,11 +2225,26 @@ function doRay(p, w, spread) {
         if (disc >= 0) { const t2 = -b - Math.sqrt(disc); if (t2 > 0 && t2 < dist) { dist = t2; zone = z; } } 
     };
     
-    if (isPl) { const cy = target.cam ? target.cam.position.y : target.targetY; chk(new THREE.Vector3(target.cam ? target.cam.position.x : target.targetX, cy, target.cam ? target.cam.position.z : target.targetZ), .25, 'head'); chk(new THREE.Vector3(target.cam ? target.cam.position.x : target.targetX, cy - 0.5, target.cam ? target.cam.position.z : target.targetZ), .35, 'chest'); chk(new THREE.Vector3(target.cam ? target.cam.position.x : target.targetX, cy - 1.2, target.cam ? target.cam.position.z : target.targetZ), .3, 'legs'); } 
+    if (isPl) {
+        // Hitboxes alineadas con el modelo visible (createPlayerModel):
+        //   - Torso BoxGeometry(.5, .7, .3) en y=1.05 (relativo al base del modelo) → en mundo: cy - 0.65
+        //   - Cabeza BoxGeometry(.3, .3, .3) en y=1.6 → en mundo: cy - 0.1
+        //   - Piernas: el modelo no tiene mesh dedicada; cubrimos la zona inferior
+        // Antes el offset era 0/-0.5/-1.2 lo que dejaba las hitboxes ~0.1m por encima
+        // del modelo visible (síntoma reportado: "hitbox sobre el personaje aunque
+        // el cuerpo está en el suelo"). Ahora coinciden con el modelo.
+        const tx = target.cam ? target.cam.position.x : target.targetX;
+        const ty = target.cam ? target.cam.position.y : target.targetY;
+        const tz = target.cam ? target.cam.position.z : target.targetZ;
+        chk(new THREE.Vector3(tx, ty - 0.10, tz), .27, 'head');
+        chk(new THREE.Vector3(tx, ty - 0.65, tz), .38, 'chest');
+        chk(new THREE.Vector3(tx, ty - 1.35, tz), .32, 'legs');
+    }
     else { chk(target.getHeadPos(), .23, 'head'); chk(target.getTorsoPos(), .33, 'chest'); chk(target.getLegsPos(), .27, 'legs'); }
     
     const targetX = isPl ? (target.cam ? target.cam.position.x : target.targetX) : target.x;
-    const targetY = isPl ? (target.cam ? target.cam.position.y - 0.5 : target.targetY - 0.5) : target.getTorsoPos().y;
+    // Centro del torso para LOS (alineado con la nueva hitbox de chest = cy - 0.65)
+    const targetY = isPl ? (target.cam ? target.cam.position.y - 0.65 : target.targetY - 0.65) : target.getTorsoPos().y;
     const targetZ = isPl ? (target.cam ? target.cam.position.z : target.targetZ) : target.z;
     if (zone && dist < bestD && hasLineOfSight(ro.x, ro.y, ro.z, targetX, targetY, targetZ)) { bestD = dist; bestTarget = target; bestZ = zone; isPlayer = isPl; isRemote = isRem;}
   };
@@ -2177,6 +2296,26 @@ function meleeHit(p, w) {
       const attackDir = Math.atan2(-dx, -dz); const back = Math.abs(normA(attackDir - op.yaw)) < Math.PI * .5; const dmg = back ? w.dmgBack : w.dmgFront;
       spawnParticles(op.cam.position, 'blood', 20, 3, 0.4); p.stats.hits++; playHitSound(false); showHit(p, false); kfeed(p, `✂ P${op.idx + 1} ${back ? 'Espalda' : 'Frente'}: -${dmg}hp`); 
       dmgPlayer(op, dmg, p);
+  }
+  // === ONLINE: cuchillazo a jugadores remotos ===
+  if (onlineMode) {
+      for (const rt of getRemoteTargets()) {
+          const dx = rt.targetX - pos.x; const dz = rt.targetZ - pos.z;
+          const distXZ = Math.sqrt(dx*dx + dz*dz);
+          if (distXZ > w.range) continue;
+          // Línea de visión para no pegar a través de paredes
+          if (!hasLineOfSight(pos.x, pos.y, pos.z, rt.targetX, rt.targetY - 0.5, rt.targetZ)) continue;
+          const attackDir = Math.atan2(-dx, -dz);
+          // El yaw del remoto está en remotePlayers[rt.uid].yaw
+          const remoteYaw = (remotePlayers[rt.uid] && remotePlayers[rt.uid].yaw) || 0;
+          const back = Math.abs(normA(attackDir - remoteYaw)) < Math.PI * .5;
+          const dmg = back ? w.dmgBack : w.dmgFront;
+          spawnParticles(new THREE.Vector3(rt.targetX, rt.targetY - 0.6, rt.targetZ), 'blood', 20, 3, 0.4);
+          p.stats.hits++; playHitSound(false); showHit(p, false);
+          kfeed(p, `🌐✂ ${rt.name || 'rival'} ${back ? 'Espalda' : 'Frente'}: -${dmg}hp`);
+          // Enviar evento de daño al servidor (la víctima lo aplica localmente)
+          reportRemoteHit(rt.uid, dmg, back ? 'back' : 'chest', rt.name);
+      }
   }
 }
 
@@ -3447,7 +3586,7 @@ function loop(ts) {
   }
 
   // === ONLINE: sincronización por frame ===
-  if (onlineMode) onlineTick(dt);
+  if (onlineMode) { onlineTick(dt); updateRemoteProjectiles(dt); }
 
   // Visibilidad: ya no usamos visible=false; las layers se encargan de que cada
   // jugador NO se vea a sí mismo pero sí vea al otro. Si está muerto sí lo ocultamos.
@@ -3575,6 +3714,7 @@ async function joinRoom(roomId, isCreating) {
     onlineRoomRef = onlineDB.ref('rooms/' + onlineRoomId);
     onlineMeRef   = onlineRoomRef.child('players/' + onlineUid);
     onlineHitsRef = onlineRoomRef.child('events');
+    onlineProjRef = onlineRoomRef.child('projectiles');
 
     try {
         if (isCreating) {
@@ -3655,21 +3795,54 @@ async function joinRoom(roomId, isCreating) {
     });
 
     // Eventos: limitToLast(20) para captar nuevos pushes en tiempo real sin replay del histórico.
+    // OJO con relojes: PC y móvil pueden tener desfase de varios segundos. Si filtrásemos
+    // con `Date.now() - ev.t > 4000` un host con reloj atrasado vería todos sus disparos
+    // descartados por el cliente (era el bug "no le hago daño aunque suene el impacto").
+    // Solución: marcamos `_onlineHitsBaseline` justo aquí y descartamos eventos cuyo `ev.t`
+    // sea CLARAMENTE anterior a nuestra incorporación (con 30s de tolerancia de skew).
+    _onlineHitsBaseline = Date.now();
     onlineHitsRef.limitToLast(20).on('child_added', snap => {
         const ev = snap.val(); if (!ev || !ev.type) return;
-        if (ev.t && Date.now() - ev.t > 4000) return; // ignora histórico viejo
+        // Histórico: solo se descarta si ev.t es muy anterior al baseline (>30s) - tolera skew.
+        if (ev.t && (_onlineHitsBaseline - ev.t) > 30000) return;
         if (ev.type === 'hit' && ev.to === onlineUid && ev.from !== onlineUid) {
+            const wasDead = P1.dead;
             dmgPlayer(P1, ev.dmg || 0, null);
             kfeed(P1, `🌐 -${ev.dmg}hp [${ev.zone || '?'}] de ${ev.fromName || '?'}`);
-            if (P1.dead) {
-                onlineHitsRef.push({ type: 'kill', from: ev.from, to: ev.from, victimName: onlineNick, t: Date.now() });
+            // Si este disparo nos mató, notificamos al atacante con un killAck.
+            // OJO: el `from` de cualquier evento DEBE ser auth.uid (víctima), por reglas
+            // de Firebase. Por eso `from = onlineUid` (yo, víctima) y `to = ev.from`
+            // (el atacante). El atacante recibirá killAck y se acreditará el kill.
+            if (P1.dead && !wasDead) {
+                onlineHitsRef.push({
+                    type: 'killAck',
+                    from: onlineUid,
+                    fromName: onlineNick,
+                    to: ev.from,
+                    victimName: onlineNick,
+                    t: Date.now()
+                }).catch(()=>{});
             }
         } else if (ev.type === 'kill' && ev.to === onlineUid && ev.from !== onlineUid) {
             // (reservado: si quisiéramos notificar al matador desde la víctima)
-        } else if (ev.type === 'killAck' && ev.to === onlineUid) {
+        } else if (ev.type === 'killAck' && ev.to === onlineUid && ev.from !== onlineUid) {
             P1.stats.kills++; P1.credits += 500;
-            kfeed(P1, `☠ Eliminaste a ${ev.victimName || 'rival'}! +500cr`);
+            kfeed(P1, `☠ Eliminaste a ${ev.victimName || ev.fromName || 'rival'}! +500cr`);
         }
+    });
+    
+    // Proyectiles: cada cliente publica los que crea, los demás los replican
+    // visualmente. Limpieza con child_removed.
+    onlineProjRef.on('child_added', snap => {
+        const data = snap.val(); if (!data) return;
+        if (data.t && Date.now() - data.t > 10000) {
+            try { onlineProjRef.child(snap.key).remove(); } catch(e) {}
+            return;
+        }
+        spawnRemoteProjectile(snap.key, data);
+    });
+    onlineProjRef.on('child_removed', snap => {
+        destroyRemoteProjectile(snap.key);
     });
 
     onlineMode = true;
@@ -3682,11 +3855,13 @@ function leaveRoom() {
     cleanupFirebaseListeners();
     if (onlineMeRef) { try { onlineMeRef.remove(); } catch(e) {} }
     destroyAllRemotePlayers();
+    destroyAllRemoteProjectiles();
     onlineMode = false;
     onlineRoomId = null;
     onlineRoomRef = null;
     onlineMeRef = null;
     onlineHitsRef = null;
+    onlineProjRef = null;
 }
 
 // Tick periódico: publica mi estado e interpola remotos.
@@ -3761,6 +3936,178 @@ function reportRemoteHit(targetUid, dmg, zone, victimName) {
         zone: zone,
         t: Date.now()
     }).catch(()=>{});
+}
+
+// === ONLINE: SINCRONIZACIÓN DE PROYECTILES =============================
+// Cada cliente publica los proyectiles que crea (granadas, cuchillos arrojadizos,
+// cohetes, gas) en /rooms/<id>/projectiles/<projId>. Los demás clientes ven el
+// child_added y crean una réplica VISUAL que simula la misma física localmente.
+// Solo el dueño aplica daño directo (vía reportRemoteHit cuando impacta a un
+// remoto). Cuando el proyectil del dueño termina, este lo borra y los demás
+// reciben child_removed y limpian. Las nubes (humo/gas) se replican en cada
+// cliente para que bloqueen LOS y se vean igual.
+function pushNetProjectile(type, pos, vel, extra) {
+    if (!onlineMode || !onlineProjRef) return null;
+    const ref = onlineProjRef.push();
+    const data = {
+        type: type,
+        from: onlineUid,
+        x: +pos.x.toFixed(3), y: +pos.y.toFixed(3), z: +pos.z.toFixed(3),
+        vx: +vel.x.toFixed(3), vy: +vel.y.toFixed(3), vz: +vel.z.toFixed(3),
+        t: Date.now()
+    };
+    if (extra) Object.assign(data, extra);
+    ref.set(data).catch(()=>{});
+    return ref.key;
+}
+
+function removeNetProjectile(projId) {
+    if (!onlineMode || !onlineProjRef || !projId) return;
+    onlineProjRef.child(projId).remove().catch(()=>{});
+}
+
+function _buildRemoteProjMesh(type) {
+    if (type === 'tknife') {
+        const geo = new THREE.BoxGeometry(0.025, 0.01, 0.32);
+        const mat = new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 1.0, roughness: 0.2 });
+        return new THREE.Mesh(geo, mat);
+    }
+    if (type === 'rocket') {
+        const grp = new THREE.Group();
+        const body = new THREE.Mesh(rocketGeo, rocketMat); body.rotation.x = Math.PI / 2; grp.add(body);
+        const tip = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.12, 8), rocketTipMat); tip.rotation.x = -Math.PI / 2; tip.position.z = -0.22; grp.add(tip);
+        return grp;
+    }
+    if (type === 'gas') {
+        return new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 8), new THREE.MeshStandardMaterial({ color: 0x88cc44, emissive: 0x224411 }));
+    }
+    // flashbang | smoke | repulsion
+    const color = type === 'flashbang' ? 0xffffff : type === 'repulsion' ? 0x66ccff : 0x555555;
+    const emissive = type === 'repulsion' ? 0x113366 : 0x000000;
+    return new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 8), new THREE.MeshStandardMaterial({ color, emissive }));
+}
+
+function spawnRemoteProjectile(projId, data) {
+    if (!data || !data.type) return;
+    if (data.from === onlineUid) return;       // el dueño tiene su copia local autoritativa
+    if (remoteProjectiles[projId]) return;     // ya existe
+    const mesh = _buildRemoteProjMesh(data.type);
+    if (!mesh) return;
+    mesh.position.set(data.x || 0, data.y || 0, data.z || 0);
+    if (data.type === 'rocket' || data.type === 'tknife') {
+        const dir = new THREE.Vector3(data.vx || 0, data.vy || 0, data.vz || 0);
+        if (dir.lengthSq() > 0.0001) {
+            dir.normalize();
+            mesh.lookAt(mesh.position.clone().add(dir));
+        }
+    }
+    scene.add(mesh);
+    remoteProjectiles[projId] = {
+        id: projId,
+        type: data.type,
+        mesh: mesh,
+        vx: data.vx || 0, vy: data.vy || 0, vz: data.vz || 0,
+        life: (data.type === 'tknife') ? 3.5 : (data.type === 'rocket') ? 4.0 : 3.5,
+        timer: 1.0,
+        grounded: false,
+        ownerUid: data.from,
+        ownerName: data.fromName || ''
+    };
+}
+
+function destroyRemoteProjectile(projId) {
+    const rp = remoteProjectiles[projId]; if (!rp) return;
+    try { scene.remove(rp.mesh); } catch (e) {}
+    delete remoteProjectiles[projId];
+}
+
+function destroyAllRemoteProjectiles() {
+    for (const id in remoteProjectiles) destroyRemoteProjectile(id);
+}
+
+// Simula la física de los proyectiles remotos cada frame (visual-only).
+// Cuando expira el timer de una granada, dispara su efecto visual local (humo,
+// nube de gas, flash, etc.). El daño es responsabilidad del dueño en su cliente.
+function updateRemoteProjectiles(dt) {
+    for (const id in remoteProjectiles) {
+        const r = remoteProjectiles[id];
+        if (!r || !r.mesh) continue;
+        r.mesh.position.x += r.vx * dt;
+        r.mesh.position.y += r.vy * dt;
+        r.mesh.position.z += r.vz * dt;
+        if (r.type === 'tknife') {
+            // Trayectoria recta sin gravedad. Estela.
+            const flight = new THREE.Vector3(r.vx, r.vy, r.vz);
+            if (flight.lengthSq() > 0.0001) {
+                flight.normalize();
+                r.mesh.lookAt(r.mesh.position.clone().add(flight));
+            }
+            spawnKnifeTrailParticle(r.mesh.position.clone());
+            r.life -= dt;
+            // Colisión con el mapa (visual): si choca, lo retiramos
+            const fy = getFloorY(r.mesh.position.x, r.mesh.position.y, r.mesh.position.z);
+            if (r.mesh.position.y <= fy + 0.05 || r.life <= 0) destroyRemoteProjectile(id);
+        } else if (r.type === 'rocket') {
+            if (Math.random() < 0.7) spawnParticles(r.mesh.position, 'smoke', 1, 0.3, 0.5);
+            r.life -= dt;
+            // Detección simple de impacto contra el suelo o muros próximos
+            const fy = getFloorY(r.mesh.position.x, r.mesh.position.y, r.mesh.position.z);
+            if (r.mesh.position.y <= fy + 0.1 || r.life <= 0) {
+                // Explosión visual local (sin daño - el dueño ya aplica daño)
+                spawnParticles(r.mesh.position, 0xffaa00, 25, 8, 0.6);
+                spawnParticles(r.mesh.position, 'smoke', 12, 2, 1.2);
+                spawnParticles(r.mesh.position, 0xff2200, 15, 6, 0.5);
+                if (audioReady) { try { audioSys.gunNoiseLoud.triggerAttackRelease("4n"); audioSys.gunThump.triggerAttackRelease("C0", "4n"); } catch(e){} }
+                destroyRemoteProjectile(id);
+            }
+        } else if (r.type === 'gas') {
+            // Granada de gas: gravedad, impacto inmediato genera nube tóxica visual
+            r.vy -= 15.0 * dt;
+            const fy = getFloorY(r.mesh.position.x, r.mesh.position.y, r.mesh.position.z);
+            if (r.mesh.position.y <= fy + 0.1) {
+                // Nube de gas visual + bloqueo de LOS, sin daño (el dueño aplica daño)
+                activeGasClouds.push({
+                    x: r.mesh.position.x, y: fy + 0.1, z: r.mesh.position.z,
+                    timer: 10.0, dmgTick: 0,
+                    owner: null,           // nadie local: no aplica daño
+                    ownerUid: r.ownerUid,  // referencia para créditos en kill chain
+                    isRemote: true
+                });
+                if (audioReady) { try { audioSys.mechSynth.triggerAttackRelease('16n'); } catch(e){} }
+                destroyRemoteProjectile(id);
+            }
+        } else {
+            // flashbang | smoke | repulsion: gravedad + bote
+            r.vy -= 15.0 * dt;
+            const fy = getFloorY(r.mesh.position.x, r.mesh.position.y, r.mesh.position.z);
+            if (r.mesh.position.y <= fy + 0.1) {
+                r.mesh.position.y = fy + 0.1;
+                if (!r.grounded) {
+                    r.grounded = true;
+                    r.timer = (r.type === 'flashbang') ? 0.5 : 1.0;
+                }
+                r.vy *= -0.18; r.vx *= 0.25; r.vz *= 0.25;
+                if (Math.abs(r.vx) < 0.15 && Math.abs(r.vz) < 0.15 && Math.abs(r.vy) < 0.5) {
+                    r.vx = 0; r.vz = 0; r.vy = 0;
+                }
+            }
+            if (r.grounded) r.timer -= dt;
+            if (r.grounded && r.timer <= 0) {
+                if (r.type === 'flashbang') {
+                    // Flash visual + flashbang local si yo estoy en cono+rango+LOS
+                    detonateFlashbang(r.mesh.position.clone());
+                } else if (r.type === 'smoke') {
+                    activeSmokes.push({ x: r.mesh.position.x, y: r.mesh.position.y, z: r.mesh.position.z, timer: 10.0 });
+                    playGunSound('smoke');
+                } else if (r.type === 'repulsion') {
+                    // Solo aplicar empuje LOCAL (a mí mismo y a mis bots) - el dueño en su
+                    // cliente también aplica empuje a su lado. No hay daño.
+                    detonateRepulsion(r.mesh.position.clone(), null);
+                }
+                destroyRemoteProjectile(id);
+            }
+        }
+    }
 }
  
 function leaveRoomLegacy() { /* placeholder eliminado */ }
