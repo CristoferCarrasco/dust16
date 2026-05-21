@@ -38,6 +38,22 @@
             "victimName": { ".validate": "newData.isString()" },
             "t":          { ".validate": "newData.isNumber()" }
           }
+        },
+
+        "projectiles": {
+          "$projId": {
+            ".validate": "newData.hasChild('type') && newData.hasChild('from') && newData.child('from').val() === auth.uid",
+            "type":     { ".validate": "newData.isString()" },
+            "from":     { ".validate": "newData.isString()" },
+            "fromName": { ".validate": "newData.isString()" },
+            "x":        { ".validate": "newData.isNumber()" },
+            "y":        { ".validate": "newData.isNumber()" },
+            "z":        { ".validate": "newData.isNumber()" },
+            "vx":       { ".validate": "newData.isNumber()" },
+            "vy":       { ".validate": "newData.isNumber()" },
+            "vz":       { ".validate": "newData.isNumber()" },
+            "t":        { ".validate": "newData.isNumber()" }
+          }
         }
       }
     }
